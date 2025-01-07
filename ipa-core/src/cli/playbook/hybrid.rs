@@ -11,12 +11,8 @@ use tokio::time::sleep;
 
 use crate::{
     ff::{Serializable, U128Conversions},
-    helpers::{
-        query::{HybridQueryParams, QueryInput, QuerySize},
-        BodyStream,
-    },
+    helpers::query::{HybridQueryParams, QueryInput, QuerySize},
     net::{Helper, IpaHttpClient},
-    protocol::QueryId,
     query::QueryStatus,
     secret_sharing::{replicated::semi_honest::AdditiveShare, SharedValue},
     test_fixture::Reconstruct,
@@ -26,29 +22,31 @@ use crate::{
 /// if results are invalid
 #[allow(clippy::disallowed_methods)] // allow try_join_all
 pub async fn run_hybrid_query_and_validate<HV>(
-    inputs: Vec<[BodyStream; 3]>,
+    inputs: Vec<[QueryInput; 3]>,
     query_size: usize,
     clients: Vec<[IpaHttpClient<Helper>; 3]>,
-    query_id: QueryId,
     query_config: HybridQueryParams,
+    set_fixed_polling_ms: Option<u64>,
 ) -> HybridQueryResult
 where
     HV: SharedValue + U128Conversions,
     AdditiveShare<HV>: Serializable,
 {
+    let query_id = inputs
+        .first()
+        .map(|v| v[0].query_id())
+        .expect("At least one shard must be used to run a Hybrid query");
     let mpc_time = Instant::now();
     assert_eq!(clients.len(), inputs.len());
     // submit inputs to each shard
     let _ = try_join_all(zip(clients.iter(), inputs.into_iter()).map(
         |(shard_clients, shard_inputs)| {
-            try_join_all(shard_clients.iter().zip(shard_inputs.into_iter()).map(
-                |(client, input)| {
-                    client.query_input(QueryInput {
-                        query_id,
-                        input_stream: input,
-                    })
-                },
-            ))
+            try_join_all(
+                shard_clients
+                    .iter()
+                    .zip(shard_inputs.into_iter())
+                    .map(|(client, input)| client.query_input(input)),
+            )
         },
     ))
     .await
@@ -56,7 +54,11 @@ where
 
     let leader_clients = &clients[0];
 
-    let mut delay = Duration::from_millis(125);
+    let (exponential_backoff, mut delay) = match set_fixed_polling_ms {
+        Some(specified_delay) => (false, Duration::from_millis(specified_delay)),
+        None => (true, Duration::from_millis(125)),
+    };
+
     loop {
         if try_join_all(
             leader_clients
@@ -72,7 +74,9 @@ where
         }
 
         sleep(delay).await;
-        delay = min(Duration::from_secs(5), delay * 2);
+        if exponential_backoff {
+            delay = min(Duration::from_secs(5), delay * 2);
+        }
         // TODO: Add a timeout of some sort. Possibly, add some sort of progress indicator to
         // the status API so we can check whether the query is making progress.
     }
